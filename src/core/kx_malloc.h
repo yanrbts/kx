@@ -1,5 +1,7 @@
-/* SDSLib, A C dynamic strings library
+/* kxmalloc - total amount of allocated memory aware version of malloc()
  *
+ * Copyright (c) 2023-2023, yanruibing <yanruibinghxu at gmail dot com>
+ * All rights reserved.
  * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *

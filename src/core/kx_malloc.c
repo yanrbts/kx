@@ -1,4 +1,4 @@
-/* zmalloc - total amount of allocated memory aware version of malloc()
+/* kxmalloc - total amount of allocated memory aware version of malloc()
  *
  * Copyright (c) 2023-2023, yanruibing <yanruibinghxu at gmail dot com>
  * All rights reserved.
