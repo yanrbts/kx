@@ -841,3 +841,110 @@ void clusterCloseAllSlots(void) {
     memset(server.cluster->importing_slots_from, 0, 
         sizeof(server.cluster->importing_slots_from));
 }
+
+/* -----------------------------------------------------------------------------
+ * Cluster state evaluation function
+ * -------------------------------------------------------------------------- */
+
+/* The following are defines that are only used in the evaluation function
+ * and are based on heuristics. Actually the main point about the rejoin and
+ * writable delay is that they should be a few orders of magnitude larger
+ * than the network latency. */
+#define CLUSTER_MAX_REJOIN_DELAY 5000
+#define CLUSTER_MIN_REJOIN_DELAY 500
+#define CLUSTER_WRITABLE_DELAY 2000
+
+void clusterUpdateState(void) {
+    int j, new_state;
+    int reachable_masters = 0;
+    static mstime_t among_minority_time;
+    static mstime_t first_call_time = 0;
+
+    server.cluster->todo_before_sleep &= ~CLUSTER_TODO_UPDATE_STATE;
+
+    /* If this is a master node, wait some time before turning the state
+     * into OK, since it is not a good idea to rejoin the cluster as a writable
+     * master, after a reboot, without giving the cluster a chance to
+     * reconfigure this node. Note that the delay is calculated starting from
+     * the first call to this function and not since the server start, in order
+     * to don't count the DB loading time. */
+    if (first_call_time == 0) first_call_time = mstime();
+    if (nodeIsMaster(myself) && 
+        server.cluster->state == CLUSTER_FAIL &&
+        mstime() - first_call_time < CLUSTER_WRITABLE_DELAY) return;
+
+    /* Start assuming the state is OK. We'll turn it into FAIL if there
+     * are the right conditions. */
+    new_state = CLUSTER_OK;
+
+    /* Check if all the slots are covered. */
+    if (server.cluster_require_full_coverage) {
+        for (j = 0; j < CLUSTER_SLOTS; j++) {
+            if (server.cluster->slots[j] == NULL ||
+                server.cluster->slots[j]->flags & (CLUSTER_NODE_FAIL)) {
+                new_state = CLUSTER_FAIL;
+                break;
+            }
+        }
+    }
+
+    /* Compute the cluster size, that is the number of master nodes
+     * serving at least a single slot.
+     *
+     * At the same time count the number of reachable masters having
+     * at least one slot. */
+    {
+        dictIterator *di;
+        dictEntry *de;
+
+        server.cluster->size = 0;
+        di = dictGetSafeIterator(server.cluster->nodes);
+        while ((de = dictNext(di)) != NULL) {
+            clusterNode *node = dictGetVal(de);
+
+            if (nodeIsMaster(node) && node->numslots) {
+                server.cluster->size++;
+                if ((node->flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL)) == 0)
+                    reachable_masters++;
+            }
+        }
+        dictReleaseIterator(di);
+    }
+
+    /* If we are in a minority partition, change the cluster state
+     * to FAIL. */
+    {
+        int needed_quorum = (server.cluster->size / 2) + 1;
+
+        if (reachable_masters < needed_quorum) {
+            new_state = CLUSTER_FAIL;
+            among_minority_time = mstime();
+        }
+    }
+
+    /* Log a state change */
+    if (new_state != server.cluster->state) {
+        mstime_t rejoin_delay = server.cluster_node_timeout;
+
+        /* If the instance is a master and was partitioned away with the
+         * minority, don't let it accept queries for some time after the
+         * partition heals, to make sure there is enough time to receive
+         * a configuration update. */
+        if (rejoin_delay > CLUSTER_MAX_REJOIN_DELAY)
+            rejoin_delay = CLUSTER_MAX_REJOIN_DELAY;
+        if (rejoin_delay < CLUSTER_MIN_REJOIN_DELAY)
+            rejoin_delay = CLUSTER_MIN_REJOIN_DELAY;
+
+        if (new_state == CLUSTER_OK
+            && nodeIsMaster(myself)
+            && mstime() - among_minority_time < rejoin_delay)
+        {
+            return;
+        }
+
+        /* Change the state and log the event. */
+        clusterLog(LL_WARNING,"Cluster state changed: %s",
+            new_state == CLUSTER_OK ? "ok" : "fail");
+        server.cluster->state = new_state;
+    }
+}
