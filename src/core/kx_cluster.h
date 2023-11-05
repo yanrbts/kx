@@ -31,9 +31,28 @@
 #ifndef __KX_CLUSTER_H__
 #define __KX_CLUSTER_H__
 
+#include <stdio.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <time.h>
+#include <syslog.h>
+#include <stdarg.h>
+#include <strings.h>
+#include <stdint.h>
+#include <string.h>
+#include "kx_malloc.h"
+#include "kx_sds.h"
+#include "kx_dict.h"
+#include "kx_adlist.h"
+
 /*-----------------------------------------------------------------------------
  * cluster data structures, defines, exported API.
  *----------------------------------------------------------------------------*/
+
+/* Error codes */
+#define C_OK                0
+#define C_ERR               -1
 
 #define CLUSTER_SLOTS       16384
 #define CLUSTER_OK          0           /* Everything looks ok */
@@ -173,4 +192,165 @@ typedef struct clusterNode {
     list *fail_reports;         /* List of nodes signaling this as failing */
 } clusterNode;
 
+typedef struct clusterState {
+    clusterNode *myself;  /* This node */
+    uint64_t currentEpoch;
+    int state;            /* CLUSTER_OK, CLUSTER_FAIL, ... */
+    int size;             /* Num of master nodes with at least one slot */
+    dict *nodes;          /* Hash table of name -> clusterNode structures */
+    dict *nodes_black_list; /* Nodes we don't re-add for a few seconds. */
+    clusterNode *migrating_slots_to[CLUSTER_SLOTS];
+    clusterNode *importing_slots_from[CLUSTER_SLOTS];
+    clusterNode *slots[CLUSTER_SLOTS];
+    uint64_t slots_keys_count[CLUSTER_SLOTS];
+    rax *slots_to_keys;
+    /* The following fields are used to take the slave state on elections. */
+    mstime_t failover_auth_time; /* Time of previous or next election. */
+    int failover_auth_count;    /* Number of votes received so far. */
+    int failover_auth_sent;     /* True if we already asked for votes. */
+    int failover_auth_rank;     /* This slave rank for current auth request. */
+    uint64_t failover_auth_epoch; /* Epoch of the current election. */
+    int cant_failover_reason;   /* Why a slave is currently not able to
+                                   failover. See the CANT_FAILOVER_* macros. */
+    /* Manual failover state in common. */
+    mstime_t mf_end;            /* Manual failover time limit (ms unixtime).
+                                   It is zero if there is no MF in progress. */
+    /* Manual failover state of master. */
+    clusterNode *mf_slave;      /* Slave performing the manual failover. */
+    /* Manual failover state of slave. */
+    long long mf_master_offset; /* Master offset the slave needs to start MF
+                                   or zero if stil not received. */
+    int mf_can_start;           /* If non-zero signal that the manual failover
+                                   can start requesting masters vote. */
+    /* The followign fields are used by masters to take state on elections. */
+    uint64_t lastVoteEpoch;     /* Epoch of the last vote granted. */
+    int todo_before_sleep; /* Things to do in clusterBeforeSleep(). */
+    /* Messages received and sent by type. */
+    long long stats_bus_messages_sent[CLUSTERMSG_TYPE_COUNT];
+    long long stats_bus_messages_received[CLUSTERMSG_TYPE_COUNT];
+    long long stats_pfail_nodes;    /* Number of nodes in PFAIL status,
+                                       excluding nodes without address. */
+} clusterState;
+
+
+/* Redis cluster messages header */
+
+/* Initially we don't know our "name", but we'll find it once we connect
+ * to the first node, using the getsockname() function. Then we'll use this
+ * address for all the next messages. */
+typedef struct {
+    char nodename[CLUSTER_NAMELEN];
+    uint32_t ping_sent;
+    uint32_t pong_received;
+    char ip[NET_IP_STR_LEN];    /* IP address last time it was seen */
+    uint16_t port;              /* base port last time it was seen */
+    uint16_t cport;             /* cluster port last time it was seen */
+    uint16_t flags;             /* node->flags copy */
+    uint32_t notused1;
+} clusterMsgDataGossip;
+
+typedef struct {
+    char nodename[CLUSTER_NAMELEN];
+} clusterMsgDataFail;
+
+typedef struct {
+    uint32_t channel_len;
+    uint32_t message_len;
+    unsigned char bulk_data[8]; /* 8 bytes just as placeholder. */
+} clusterMsgDataPublish;
+
+typedef struct {
+    uint64_t configEpoch;                   /* Config epoch of the specified instance. */
+    char nodename[CLUSTER_NAMELEN];         /* Name of the slots owner. */
+    unsigned char slots[CLUSTER_SLOTS/8];   /* Slots bitmap. */
+} clusterMsgDataUpdate;
+
+typedef struct {
+    uint64_t module_id;     /* ID of the sender module. */
+    uint32_t len;           /* ID of the sender module. */
+    uint8_t type;           /* Type from 0 to 255. */
+    unsigned char bulk_data[3]; /* 3 bytes just as placeholder. */
+} clusterMsgModule;
+
+union clusterMsgData {
+    /* PING, MEET and PONG */
+    struct {
+        /* Array of N clusterMsgDataGossip structures */
+        clusterMsgDataGossip gossip[1];
+    } ping;
+
+    /* FAIL */
+    struct {
+        clusterMsgDataFail about;
+    } fail;
+
+    /* PUBLISH */
+    struct {
+        clusterMsgDataPublish msg;
+    } publish;
+
+    /* UPDATE */
+    struct {
+        clusterMsgDataUpdate nodecfg;
+    } update;
+
+    /* MODULE */
+    struct {
+        clusterMsgModule msg;
+    } module;
+};
+
+#define CLUSTER_PROTO_VER 1 /* Cluster bus protocol version. */
+
+typedef struct {
+    char sig[4];        /* Signature "RCmb" (Redis Cluster message bus). */
+    uint32_t totlen;    /* Total length of this message */
+    uint16_t ver;       /* Protocol version, currently set to 1. */
+    uint16_t port;      /* TCP base port number. */
+    uint16_t type;      /* Message type */
+    uint16_t count;     /* Only used for some kind of messages. */
+    uint64_t currentEpoch;  /* The epoch accordingly to the sending node. */
+    uint64_t configEpoch;   /* The config epoch if it's a master, or the last
+                               epoch advertised by its master if it is a
+                               slave. */
+    uint64_t offset;    /* Master replication offset if node is a master or
+                           processed replication offset if node is a slave. */
+    char sender[CLUSTER_NAMELEN]; /* Name of the sender node */
+    unsigned char myslots[CLUSTER_SLOTS/8];
+    char slaveof[CLUSTER_NAMELEN];
+    char myip[NET_IP_STR_LEN];    /* Sender IP, if not all zeroed. */
+    char notused1[34];  /* 34 bytes reserved for future usage. */
+    uint16_t cport;      /* Sender TCP cluster bus port */
+    uint16_t flags;      /* Sender node flags */
+    unsigned char state; /* Cluster state from the POV of the sender */
+    unsigned char mflags[3]; /* Message flags: CLUSTERMSG_FLAG[012]_... */
+    union clusterMsgData data;
+} clusterMsg;
+
+typedef struct cluster {
+    int cluster_enabled;            /* Is cluster enabled? */
+    mstime_t cluster_node_timeout;  /* Cluster node timeout. */
+    struct clusterState *cluster;   /* State of the cluster */
+    int cluster_migration_barrier; /* Cluster replicas migration barrier. */
+    int cluster_slave_validity_factor; /* Slave max data age for failover. */
+    int cluster_require_full_coverage; /* If true, put the cluster down if
+                                          there is at least an uncovered slot.*/
+    int cluster_slave_no_failover;  /* Prevent slave from starting a failover
+                                       if the master is in failure state. */
+    char *cluster_announce_ip;  /* IP address to announce on cluster bus. */
+    int cluster_announce_port;     /* base port to announce on cluster bus. */
+    int cluster_announce_bus_port; /* bus port to announce on cluster bus. */
+    int cluster_module_flags;      /* Set of flags that Redis modules are able
+                                      to set in order to suppress certain
+                                      native Redis Cluster features. Check the
+                                      REDISMODULE_CLUSTER_FLAG_*. */
+    char *logfile;                  /* Path of log file */
+    int verbosity;                  /* Loglevel in redis.conf */
+    /* time cache */
+    time_t unixtime;    /* Unix time sampled every cron cycle. */
+    time_t timezone;    /* Cached timezone. As set by tzset(). */
+    int daylight_active;    /* Currently in daylight saving time. */
+} cluster;
+
+extern struct cluster server;
 #endif
